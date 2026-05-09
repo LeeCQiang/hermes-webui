@@ -17,7 +17,7 @@ let _kanbanBoardMenuOpen = false;
 // EventSource fails to connect (proxy that strips text/event-stream, etc).
 let _kanbanEventSource = null;
 let _kanbanEventSourceFailures = 0;
-let _skillsData = null; // cached skills list
+let _skillsData = null; // 缓存技能列表（从后端 /api/skills 加载）
 let _cronList = null; // cached cron jobs (array)
 let _currentCronDetail = null; // full cron job object
 let _cronMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
@@ -762,6 +762,10 @@ function _renderCronForm({ name, schedule, prompt, deliver, profile, no_agent=fa
   if (focusEl) focusEl.focus();
 }
 
+/**
+ * 渲染已选技能的标签列表（在 cron 创建表单中）。
+ * 每个标签带 × 删除按钮，点击可从 _cronSelectedSkills 中移除。
+ */
 function _renderCronSkillTags(){
   const wrap=$('cronFormSkillTags');
   if(!wrap)return;
@@ -779,6 +783,11 @@ function _renderCronSkillTags(){
   }
 }
 
+/**
+ * 绑定 cron 创建表单中的技能搜索选择器。
+ * 输入关键词时从缓存中搜索匹配的技能名/分类，显示最多8个匹配项供选择。
+ * 选中后添加为标签，可从标签中移除。
+ */
 function _bindCronSkillPicker(){
   const search=$('cronFormSkillSearch');
   const dropdown=$('cronFormSkillDropdown');
@@ -2403,27 +2412,28 @@ async function clearConversation() {
   } catch(e) { setStatus(t('clear_failed') + e.message); }
 }
 
-// ── Skills panel ──
+// ── Skills 技能面板 ──
+// 从后端加载技能列表并渲染到左侧面板。
+// 技能数据来自 ~/.hermes/skills/ 目录下的 SKILL.md 文件。
 async function loadSkills() {
-  if (_skillsData) { renderSkills(_skillsData); return; }
+  if (_skillsData) { renderSkills(_skillsData); return; } // 已缓存则直接渲染
   const box = $('skillsList');
   try {
     const data = await api('/api/skills');
     _skillsData = data.skills || [];
-    // Prune collapsed state to only keep categories present in fresh data,
-    // avoiding stale keys when categories are renamed or removed server-side.
+    // 清除已失效的分类折叠状态（服务端可能已删除或重命名分类）
     const liveCats = new Set(_skillsData.map(s => s.category || '(general)'));
     for (const c of _collapsedCats) { if (!liveCats.has(c)) _collapsedCats.delete(c); }
     renderSkills(_skillsData);
   } catch(e) { box.innerHTML = `<div style="padding:12px;color:var(--accent);font-size:12px">Error: ${esc(e.message)}</div>`; }
 }
 
-let _collapsedCats = new Set(); // persisted collapsed state across re-renders
+let _collapsedCats = new Set(); // 技能分类的折叠状态（持久化，面板切换后保留）
 
 function _toggleCatCollapse(cat) {
   if (_collapsedCats.has(cat)) _collapsedCats.delete(cat);
   else _collapsedCats.add(cat);
-  // Toggle DOM without full re-render
+  // 直接操作 DOM 切换折叠，避免全量重渲染
   document.querySelectorAll('.skills-category').forEach(sec => {
     const header = sec.querySelector('.skills-cat-header');
     if (header && header.dataset.cat === cat) {
@@ -2435,14 +2445,20 @@ function _toggleCatCollapse(cat) {
   });
 }
 
+/**
+ * 渲染技能列表到面板左侧。
+ * 技能按分类分组显示，支持关键词搜索（匹配名称/描述/分类）。
+ * 每个技能条目可点击，打开详情查看。
+ */
 function renderSkills(skills) {
   const query = ($('skillsSearch').value || '').toLowerCase();
+  // 关键词搜索：匹配技能名称、描述、分类
   const filtered = query ? skills.filter(s =>
     (s.name||'').toLowerCase().includes(query) ||
     (s.description||'').toLowerCase().includes(query) ||
     (s.category||'').toLowerCase().includes(query)
   ) : skills;
-  // Group by category
+  // 按分类分组：每个技能属于一个分类（如 devops, mlops, github 等）
   const cats = {};
   for (const s of filtered) {
     const cat = s.category || '(general)';
@@ -2466,6 +2482,7 @@ function renderSkills(skills) {
       const el = document.createElement('div');
       el.className = 'skill-item';
       el.style.display = collapsed ? 'none' : '';
+      // 技能条目：左侧显示名称（skill-name），右侧显示描述摘要（skill-desc）
       el.innerHTML = `<span class="skill-name">${esc(skill.name)}</span><span class="skill-desc">${esc(skill.description||'')}</span>`;
       el.onclick = () => openSkill(skill.name, el);
       sec.appendChild(el);
@@ -2475,16 +2492,19 @@ function renderSkills(skills) {
 }
 
 function filterSkills() {
-  if (_skillsData) renderSkills(_skillsData);
+  if (_skillsData) renderSkills(_skillsData); // 搜索框输入时实时过滤渲染
 }
 
-// Currently selected skill detail — kept across panel switches so re-entering
-// the Skills view shows the last-viewed skill.
-let _currentSkillDetail = null; // { name, category, content }
-let _skillMode = 'empty'; // 'empty' | 'read' | 'create' | 'edit'
-let _skillPreFormDetail = null; // snapshot of previously-viewed skill when entering a form
-let _editingSkillName = null;
+// 当前选中的技能详情——面板切换后保留，再次进入时恢复上次查看的技能
+let _currentSkillDetail = null; // { name, category, content } 技能详情缓存
+let _skillMode = 'empty'; // 面板模式: 'empty'(空) | 'read'(查看) | 'create'(新建) | 'edit'(编辑)
+let _skillPreFormDetail = null; // 进入编辑/新建前的技能快照，取消时恢复
+let _editingSkillName = null; // 正在编辑的技能名称（用于保存时判断是新建还是更新）
 
+/**
+ * 从 SKILL.md 内容中剥离 YAML frontmatter（--- 之间的元数据块）。
+ * 返回 { frontmatter: 元数据文本|null, body: 正文内容 }
+ */
 function _stripYamlFrontmatter(content) {
   if (!content) return { frontmatter: null, body: '' };
   const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(content);
@@ -2492,6 +2512,10 @@ function _stripYamlFrontmatter(content) {
   return { frontmatter: m[1], body: content.slice(m[0].length) };
 }
 
+/**
+ * 渲染技能详情内容到右侧详情面板。
+ * 显示: 名称 → 解析 frontmatter 元数据（可折叠） → Markdown 正文 → 关联文件列表
+ */
 function _renderSkillDetail(name, content, linkedFiles) {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
@@ -2501,10 +2525,12 @@ function _renderSkillDetail(name, content, linkedFiles) {
   if (title) title.textContent = name;
   const { frontmatter, body: markdownBody } = _stripYamlFrontmatter(content);
   let html = '';
+  // frontmatter YAML 元数据 → 可折叠摘要块，可展开查看原始键值对
   if (frontmatter) {
     html += `<details class="skill-frontmatter"><summary>${esc(t('skill_metadata'))}</summary><pre><code>${esc(frontmatter)}</code></pre></details>`;
   }
   html += renderMd(markdownBody || '(no content)');
+  // 渲染关联文件链接列表（脚本/模板/引用等，有则显示）
   const lf = linkedFiles || {};
   const categories = Object.entries(lf).filter(([,files]) => files && files.length > 0);
   if (categories.length) {
@@ -2528,6 +2554,11 @@ function _renderSkillDetail(name, content, linkedFiles) {
   _setSkillHeaderButtons('read');
 }
 
+/**
+ * 切换技能详情面板顶部的按钮显示状态。
+ * @param {'empty'|'read'|'create'|'edit'} mode - 面板模式
+ *    empty=无按钮, read=显示[编辑][删除], create/edit=显示[取消][保存]
+ */
 function _setSkillHeaderButtons(mode) {
   const editBtn = $('btnEditSkillDetail');
   const delBtn = $('btnDeleteSkillDetail');
@@ -2540,8 +2571,12 @@ function _setSkillHeaderButtons(mode) {
   else { hide(editBtn); hide(delBtn); hide(cancelBtn); hide(saveBtn); }
 }
 
+/**
+ * 点击技能条目时调用：从后端加载技能完整内容（含 frontmatter 正文 + 关联文件）。
+ * 高亮选中的技能条目，渲染右侧详情面板。
+ */
 async function openSkill(name, el) {
-  // Highlight active skill in the sidebar list
+  // 高亮当前选中的技能条目
   document.querySelectorAll('.skill-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
   _skillPreFormDetail = null;
@@ -2553,6 +2588,10 @@ async function openSkill(name, el) {
   } catch(e) { setStatus(t('skill_load_failed') + e.message); }
 }
 
+/**
+ * 打开技能的关联文件预览（脚本/模板/引用等）。
+ * Markdown 文件渲染为格式化视图，其余文件显示为原始代码。
+ */
 async function openSkillFile(skillName, filePath) {
   try {
     const data = await api(`/api/skills/content?name=${encodeURIComponent(skillName)}&file=${encodeURIComponent(filePath)}`);
@@ -2587,6 +2626,10 @@ async function openSkillFile(skillName, filePath) {
   } catch(e) { setStatus(t('skill_file_load_failed') + e.message); }
 }
 
+/**
+ * 点击「编辑」按钮：将当前技能详情切换到编辑表单模式。
+ * 保存当前技能快照以便取消时恢复。
+ */
 function editCurrentSkill() {
   if (!_currentSkillDetail) return;
   const s = _currentSkillDetail;
@@ -2601,6 +2644,10 @@ function editCurrentSkill() {
   _renderSkillForm({ name: s.name, category, content: s.content || '', isEdit: true });
 }
 
+/**
+ * 点击「新建技能」按钮：清空表单，进入创建模式。
+ * 保存当前查看的技能快照，取消时恢复。
+ */
 function openSkillCreate() {
   if (typeof switchPanel === 'function' && _currentPanel !== 'skills') switchPanel('skills');
   _skillPreFormDetail = _currentSkillDetail ? { ..._currentSkillDetail } : null;
@@ -2609,6 +2656,11 @@ function openSkillCreate() {
   _renderSkillForm({ name: '', category: '', content: '', isEdit: false });
 }
 
+/**
+ * 渲染技能编辑/新建表单。
+ * 包含: 名称输入、分类输入、SKILL.md 内容编辑区（textarea）。
+ * 编辑模式下名称不可更改（只读）。
+ */
 function _renderSkillForm({ name, category, content, isEdit }) {
   const title = $('skillDetailTitle');
   const body = $('skillDetailBody');
@@ -2643,6 +2695,10 @@ function _renderSkillForm({ name, category, content, isEdit }) {
   if (focusEl) focusEl.focus();
 }
 
+/**
+ * 取消编辑/新建：恢复之前的技能快照或回到空状态。
+ * 如果有 preForm 快照则还原查看模式，否则清空详情面板。
+ */
 function cancelSkillForm() {
   _editingSkillName = null;
   if (_skillPreFormDetail) {
@@ -2665,6 +2721,11 @@ function cancelSkillForm() {
   _setSkillHeaderButtons('empty');
 }
 
+/**
+ * 保存技能到 ~/.hermes/skills/：新建或更新 SKILL.md 文件。
+ * 自动清理名称（转小写、空格→连字符），提交 POST 到 /api/skills/save。
+ * 保存后清空缓存，重新加载技能列表。
+ */
 async function saveSkillForm() {
   const nameInput = $('skillFormName');
   const catInput = $('skillFormCategory');

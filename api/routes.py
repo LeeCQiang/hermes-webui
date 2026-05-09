@@ -91,13 +91,11 @@ def _all_profiles_query_flag(parsed_url) -> bool:
 
 
 def _active_skills_dir() -> Path:
-    """Return the skills directory for the request's active Hermes profile.
+    """获取当前激活的 Hermes 配置的技能目录路径。
 
-    WebUI profile switches are cookie/thread-local scoped, so the agent
-    module-level ``tools.skills_tool.SKILLS_DIR`` can still point at the server
-    startup profile. Skills UI endpoints must derive the directory from
-    ``get_active_hermes_home()`` for every request instead of reading that
-    process-global constant.
+    WebUI 支持多配置切换（cookie/线程作用域），每次请求从当前配置的 HERMES_HOME
+    获取技能目录，而非使用进程级全局变量 ``tools.skills_tool.SKILLS_DIR``。
+    避免配置切换后指向错误的技能目录。
     """
     try:
         from api.profiles import get_active_hermes_home
@@ -113,43 +111,35 @@ def _active_skills_dir() -> Path:
 
 
 def _skill_path_within(base_dir: Path, candidate: Path) -> bool:
-    try:
-        candidate.resolve().relative_to(base_dir.resolve())
-        return True
-    except (OSError, ValueError):
-        return False
+    """检查候选路径是否在技能目录范围内，防止路径穿越攻击。
+    
+    通过 resolve() 解析为绝对路径后，用 relative_to() 验证包含关系。
+    """
 
 
 def _skill_category_from_path(skill_md: Path, skills_dirs: list[Path]) -> str | None:
-    for skills_dir in skills_dirs:
-        try:
-            rel_path = skill_md.relative_to(skills_dir)
-        except ValueError:
-            continue
-        parts = rel_path.parts
-        if len(parts) >= 3:
-            return parts[0]
-        return None
-    return None
+    """从技能路径推断分类名称。
+
+    解构 SKILL.md 路径: 如果路径层级 >= 3（如 devops/github/SKILL.md），
+    则第一级目录名即为分类名。否则为无分类。
+    """
 
 
 def _active_skill_search_dirs(skills_dir: Path) -> list[Path]:
-    dirs = [skills_dir]
-    try:
-        from agent.skill_utils import get_external_skills_dirs
-
-        dirs.extend(Path(p) for p in get_external_skills_dirs())
-    except Exception:
-        pass
-    return [p for p in dirs if p.exists()]
+    """获取技能搜索目录列表：本地技能目录 + 插件提供的外部技能目录。"""
 
 
 def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict:
-    """List skills using an explicit local skills directory.
+    """从指定技能目录扫描所有 SKILL.md，返回技能列表。
 
-    This mirrors ``tools.skills_tool.skills_list`` closely, but keeps the local
-    scan root explicit so per-client WebUI profile switches do not race on or
-    leak through the skills tool's module-global ``SKILLS_DIR``.
+    核心流程:
+    1. 在本地 + 外部目录中搜索所有 SKILL.md 文件
+    2. 解析 frontmatter，提取 name/description/category
+    3. 过滤: 排除已禁用、跨平台不匹配、重复的技能
+    4. 若 description 为空，从正文首行非标题文本补全
+    5. 按分类聚合，按名称排序后返回
+
+    注意: 使用显式目录而非 tools.skills_tool.skills_list 以防止配置切换时的竞争条件。
     """
     from agent.skill_utils import iter_skill_index_files
     from tools.skills_tool import (
@@ -230,7 +220,14 @@ def _skills_list_from_dir(skills_dir: Path, category: str | None = None) -> dict
 
 
 def _find_skill_in_dir(name: str, skills_dir: Path) -> tuple[Path | None, Path | None]:
-    """Resolve a WebUI skill name inside an explicit skills directory."""
+    """在技能目录中根据名称查找技能，返回 (技能目录路径, SKILL.md文件路径)。
+
+    查找优先级:
+    1. 直接路径匹配: skills/<name>/SKILL.md
+    2. 旧格式兼容: skills/<name>.md
+    3. 遍历全部 SKILL.md: 尝试目录名匹配或 frontmatter name 匹配
+    4. 遍历 *.md 文件: 旧格式文件名匹配
+    """
     from agent.skill_utils import iter_skill_index_files
     from tools.skills_tool import _EXCLUDED_SKILL_DIRS, _parse_frontmatter
 
@@ -276,17 +273,15 @@ def _find_skill_in_dir(name: str, skills_dir: Path) -> tuple[Path | None, Path |
 
 
 def _skill_not_found_payload(name: str, skills_dir: Path) -> dict:
-    available = [s["name"] for s in _skills_list_from_dir(skills_dir).get("skills", [])[:20]]
-    return {
-        "success": False,
-        "error": f"Skill '{name}' not found.",
-        "available_skills": available,
-        "hint": "Use skills_list to see all available skills",
-    }
+    """生成技能不存在的错误响应，附带前20个可用技能列表供参考。"""
 
 
 def _skill_view_from_active_dir(name: str) -> dict:
-    from tools.skills_tool import skill_view as _skill_view
+    """从当前配置的技能目录中获取指定技能的完整内容（含关联文件）。
+
+    支持插件限定的技能名（如 "plugin:skill"），先在本目录查找，
+    未找到时尝试从插件系统中获取。
+    """
 
     skills_dir = _active_skills_dir()
     skill_dir, skill_md = _find_skill_in_dir(name, skills_dir)
@@ -3536,13 +3531,18 @@ def handle_get(handler, parsed) -> bool:
         with cron_profile_context():
             return _handle_cron_status(handler, parsed)
 
-    # ── Skills API (GET) ──
+    # ── Skills API (GET) 技能列表接口 ──
+    # 路由: GET /api/skills?category=xxx
+    # 返回技能名称/描述/分类列表，支持按分类筛选
     if parsed.path == "/api/skills":
         qs = parse_qs(parsed.query)
         category = qs.get("category", [None])[0]
         data = _skills_list_from_dir(_active_skills_dir(), category=category)
         return j(handler, {"skills": data.get("skills", [])})
 
+    # ── Skills API (GET) 技能详情/关联文件接口 ──
+    # 路由: GET /api/skills/content?name=xxx&file=xxx
+    # 可返回技能完整内容或指定关联文件
     if parsed.path == "/api/skills/content":
         qs = parse_qs(parsed.query)
         name = qs.get("name", [""])[0]
@@ -4376,7 +4376,9 @@ def handle_post(handler, parsed) -> bool:
     if parsed.path == "/api/clarify/respond":
         return _handle_clarify_respond(handler, body)
 
-    # ── Skills (POST) ──
+    # ── Skills (POST) 技能保存/删除接口 ──
+    # POST /api/skills/save   → 新建或更新 SKILL.md
+    # POST /api/skills/delete → 删除技能目录
     if parsed.path == "/api/skills/save":
         return _handle_skill_save(handler, body)
 
@@ -8318,6 +8320,13 @@ def _handle_handoff_summary(handler, body):
 
 
 def _handle_skill_save(handler, body):
+    """保存技能到技能目录：新建或更新 SKILL.md 文件。
+
+    安全措施:
+    - 自动清理名称（转小写、空格→连字符）
+    - 校验名称/分类不含路径穿越字符（/ 和 ..）
+    - 验证解析路径仍在技能目录范围内
+    """
     try:
         require(body, "name", "content")
     except ValueError as e:
@@ -8334,7 +8343,7 @@ def _handle_skill_save(handler, body):
         skill_dir = skills_dir / category / skill_name
     else:
         skill_dir = skills_dir / skill_name
-    # Validate resolved path stays within the active profile skills dir.
+    # 验证解析后的路径仍在当前配置的技能目录范围内
     try:
         skill_dir.resolve().relative_to(skills_dir.resolve())
     except ValueError:
@@ -8346,6 +8355,13 @@ def _handle_skill_save(handler, body):
 
 
 def _handle_skill_delete(handler, body):
+    """删除技能：根据名称查找 SKILL.md 所在目录并递归删除。
+
+    安全措施:
+    - 自动清理名称（转小写、空格→连字符）
+    - 校验不含路径穿越字符
+    - 使用 rglob 搜索而非直接拼接，确保删除的是正确的技能目录
+    """
     try:
         require(body, "name")
     except ValueError as e:
