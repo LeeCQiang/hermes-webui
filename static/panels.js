@@ -2446,6 +2446,110 @@ function _toggleCatCollapse(cat) {
 }
 
 /**
+ * 技能中文描述映射表：为每个技能在UI显示时追加中文说明。
+ * 修改此表可自定义任何技能的中文标注文本。
+ */
+const _SKILL_CN_DESC = {
+  'ai-trader': 'AI交易信号平台：发布信号、跟随交易者、自动交易',
+  'ai-trader-copytrade': 'AI跟单系统：关注/取消交易者、管理跟单订阅',
+  'ai-trader-heartbeat': 'AI心跳监控：轮询通知、回复、提及、关注者事件',
+  'ai-trader-market-intel': 'AI市场情报：读取金融事件快照',
+  'ai-trader-polymarket': 'Polymarket发现：查询市场与订单簿',
+  'ai-trader-tradesync': 'AI交易同步：发布实时信号、策略、讨论',
+  'airtable': 'Airtable数据库：记录增删改查、过滤、导入',
+  'architecture-diagram': '架构图生成：深色主题SVG图表HTML',
+  'arxiv': '论文搜索：关键词、作者、分类、ID检索',
+  'ascii-art': 'ASCII艺术：pyfiglet、cowsay、图片转ASCII',
+  'ascii-video': 'ASCII视频：视频/音频转彩色ASCII动画',
+  'audiocraft-audio-generation': '音频生成：MusicGen文本转音乐、AudioGen文本转音效',
+  'axolotl': 'LLM微调工具：YAML配置LoRA/DPO/GRPO微调',
+  'baoyu-comic': '知识漫画：教育、传记、教程类漫画生成',
+  'baoyu-infographic': '信息图：21种布局×21种风格的信息图表',
+  'blogwatcher': '博客监控：RSS/Atom订阅跟踪工具',
+  'btc-trader-strategy': 'BTC/USDT永续合约交易机器人：多因子趋势跟综、AI评分执行',
+  'claude-code': 'Claude Code委托：功能开发、PR创建',
+  'claude-design': 'Claude设计：一次性HTML原型/落地页/演示',
+  'codebase-inspection': '代码库分析：pygount统计代码量、语言、比例',
+  'codex': 'Codex委托：OpenAI编码任务处理',
+  'comfyui': 'ComfyUI工作流：图像/视频生成与管理',
+  'debugging-hermes-tui-commands': 'Hermes TUI调试：Python网关、Ink UI命令行',
+  'design-md': 'DESIGN.md规范：编辑/验证/导出Token规范文件',
+  'dogfood': '内部QA测试：Web应用探索性Bug检测',
+  'dspy': 'DSPy声明式编程：自动优化提示词+RAG管道',
+  'evaluating-llms-harness': 'LLM评测框架：MMLU/GSM8K等基准测试',
+  'excalidraw': '手绘风格图表：架构图、流程图、时序图',
+  'fine-tuning-with-trl': 'TRL微调套件：SFT/DPO/PPO/GRPO/奖励建模',
+  'gif-search': 'GIF搜索：通过Tenor搜索下载GIF动图',
+  'github-actions-deployment': 'GitHub Actions部署：定时任务云执行',
+  'github-auth': 'GitHub认证：HTTPS令牌、SSH密钥、gh CLI登录',
+  'github-code-review': '代码审查：diff对比、行内评论、PR审查',
+  'github-issues': 'Issue管理：创建、分类、标签、指派',
+  'github-pr-workflow': 'PR工作流：分支、提交、开启、CI、合并',
+  'github-repo-management': '仓库管理：克隆/创建/Fork、Release操作',
+  'godmode': '模型越狱测试：特殊提示词技术',
+  'google-workspace': 'Google办公套件：Gmail/日历/Drive/文档/表格',
+  'heartmula': '音乐生成：Suno风格从歌词+标签生成歌曲',
+  'hermes-agent': 'Hermes配置：扩展、配置、贡献Agent本身',
+  'hermes-agent-skill-authoring': '技能编写：SKILL.md前注、验证器、结构规范',
+  'himalaya': '终端邮件：IMAP/SMTP命令行邮件客户端',
+  'huggingface-hub': 'HuggingFace Hub：搜索/下载/上传模型和数据集',
+  'humanizer': '文本人性化：去除AI痕迹、增加真实感',
+  'ideation': '创意构思：通过约束条件生成项目创意',
+  'jupyter-live-kernel': 'Jupyter交互编程：实时内核迭代Python',
+  'kanban-orchestrator': '看板编排器：任务分解+专家轮值+反诱惑规则',
+  'kanban-worker': '看板工人：注意事项、示例、边界案例',
+  'linear': 'Linear项目管理：Issue操作、团队协作、GraphQL API',
+  'llama-cpp': 'llama.cpp本地推理：GGUF模型+HuggingFace发现',
+  'llm-wiki': 'LLM知识库：构建/查询互联Markdown知识库',
+  'manim-video': 'Manim动画：3Blue1Brown风格数学/算法视频',
+  'maps': '地图服务：地理编码、POI、路线规划、时区',
+  'market-intel': '市场情报：读取AI-Trader金融事件快照和市场数据',
+  'minecraft-modpack-server': 'Minecraft模组服务器：CurseForge/Modrinth托管',
+  'nano-pdf': 'PDF编辑：文本修改、标题修正、自然语言操作',
+  'native-mcp': 'MCP协议客户端：连接服务器、注册工具',
+  'node-inspect-debugger': 'Node.js调试：--inspect + Chrome DevTools协议',
+  'notion': 'Notion API：页面、数据库、块、搜索操作',
+  'obliteratus': '模型去拒绝：diff-in-means方法移除LLM拒绝',
+  'obsidian': 'Obsidian笔记：读取、搜索、创建、编辑笔记',
+  'ocr-and-documents': 'OCR文档提取：PDF/扫描件文字识别',
+  'opencode': 'OpenCode委托：编码任务+代码审查',
+  'openhue': '飞利浦Hue控制：灯光、场景、房间管理',
+  'outlines': '结构化输出：JSON/正则/Pydantic约束生成',
+  'p5js': 'p5.js创意编程：生成艺术、着色器、交互、3D',
+  'pixel-art': '像素艺术：复古调色板（NES、Game Boy、PICO-8）',
+  'plan': '计划模式：编写Markdown计划文件，不执行',
+  'pokemon-player': '宝可梦模拟器：无头模拟器+内存读取自动操作',
+  'polymarket': '预测市场查询：市场、价格、订单簿、历史',
+  'polymarket-public-data': 'Polymarket公开数据：直接API读取元数据与价格',
+  'popular-web-designs': '网页设计库：54套真实设计系统HTML/CSS',
+  'powerpoint': 'PPT操作：创建、读取、编辑演示文稿',
+  'pretext': 'Pretext文字排版：DOM-Free文本布局艺术',
+  'project-proposals': '项目提案：竞赛/黑客松/资助申请专业文案',
+  'python-debugpy': 'Python调试：pdb REPL + debugpy远程DAP调试',
+  'requesting-code-review': '提交前审查：安全检查、质量门禁、自动修复',
+  'research-paper-writing': '论文写作：NeurIPS/ICML/ICLR顶会论文指导',
+  'segment-anything-model': 'SAM分割模型：零样本图像分割',
+  'serving-llms-vllm': 'vLLM推理服务：高吞吐+OpenAI兼容API',
+  'sketch': '快速原型：2-3种HTML设计变体对比',
+  'songsee': '音频可视化：频谱图、声学特征提取',
+  'songwriting-and-ai-music': '歌曲创作：作词技巧+Suno AI音乐提示词',
+  'spike': '技术验证：快速实验验证想法可行性',
+  'spotify': 'Spotify音乐：播放、搜索、管理播放列表和设备',
+  'subagent-driven-development': '子代理开发：委托任务执行+两阶段审查',
+  'systematic-debugging': '系统调试：4阶段根因分析定位Bug',
+  'teams-meeting-pipeline': 'Teams会议：摘要管道、状态检查、重放、订阅管理',
+  'test-driven-development': 'TDD方法论：红绿重构循环、先测试后编码',
+  'touchdesigner-mcp': 'TouchDesigner控制：创建算子、设置参数、实时视觉',
+  'unsloth': 'Unsloth加速：2-5倍快速LoRA/QLoRA微调',
+  'webhook-subscriptions': 'Webhook订阅：事件驱动Agent自动运行',
+  'weights-and-biases': 'W&B实验管理：日志记录、调参、模型注册表',
+  'writing-plans': '计划编写：拆分为可执行任务、路径、代码',
+  'xurl': 'X/Twitter客户端：发帖、搜索、私信、媒体操作',
+  'youtube-content': 'YouTube内容：转录→摘要、推文、博客文章',
+  'yuanbao': '元宝群组：@提及用户、查询信息/成员',
+};
+
+/**
  * 渲染技能列表到面板左侧。
  * 技能按分类分组显示，支持关键词搜索（匹配名称/描述/分类）。
  * 每个技能条目可点击，打开详情查看。
@@ -2482,8 +2586,10 @@ function renderSkills(skills) {
       const el = document.createElement('div');
       el.className = 'skill-item';
       el.style.display = collapsed ? 'none' : '';
-      // 技能条目：左侧显示名称（skill-name），右侧显示描述摘要（skill-desc）
-      el.innerHTML = `<span class="skill-name">${esc(skill.name)}</span><span class="skill-desc">${esc(skill.description||'')}</span>`;
+      // 技能条目：左侧显示名称（skill-name），右侧显示描述摘要 + 中文注释
+      const cn = _SKILL_CN_DESC[skill.name];
+      const cnHtml = cn ? ` <span class="skill-cn-desc">${esc(cn)}</span>` : '';
+      el.innerHTML = `<span class="skill-name">${esc(skill.name)}</span><span class="skill-desc">${esc(skill.description||'')}${cnHtml}</span>`;
       el.onclick = () => openSkill(skill.name, el);
       sec.appendChild(el);
     }
