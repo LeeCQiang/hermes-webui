@@ -26,6 +26,7 @@ from api.agent_sessions import (
     MESSAGING_SOURCES,
     is_cli_session_row,
     is_cli_session_row_visible,
+    read_session_lineage_report,
 )
 
 logger = logging.getLogger(__name__)
@@ -774,6 +775,8 @@ from api.config import (
     set_reasoning_effort,
     create_stream_channel,
     get_webui_session_save_mode,
+    STREAM_GOAL_RELATED,
+    PENDING_GOAL_CONTINUATION,
 )
 from api.helpers import (
     require,
@@ -2521,6 +2524,39 @@ def _streams_lock_health(timeout_seconds: float = 0.5) -> dict:
         STREAMS_LOCK.release()
 
 
+def _run_lifecycle_health() -> dict:
+    """Return active worker-run state independent of SSE stream presence."""
+    # Import the module rather than relying only on imported scalar aliases so
+    # LAST_RUN_FINISHED_AT stays fresh after unregister_active_run() updates it.
+    from api import config as _live_config
+
+    now = time.time()
+    with _live_config.ACTIVE_RUNS_LOCK:
+        runs = []
+        for stream_id, raw in (_live_config.ACTIVE_RUNS or {}).items():
+            item = dict(raw or {})
+            started_at = item.get("started_at")
+            try:
+                age = max(0.0, now - float(started_at))
+            except Exception:
+                age = 0.0
+            item.setdefault("stream_id", stream_id)
+            item["age_seconds"] = round(age, 1)
+            runs.append(item)
+        last_finished = _live_config.LAST_RUN_FINISHED_AT
+    runs.sort(key=lambda item: float(item.get("started_at") or 0.0))
+    payload = {
+        "active_runs": len(runs),
+        "runs": runs,
+        "last_run_finished_at": last_finished,
+    }
+    if runs:
+        payload["oldest_run_age_seconds"] = runs[0].get("age_seconds", 0.0)
+    elif last_finished:
+        payload["idle_seconds_since_last_run"] = round(max(0.0, now - float(last_finished)), 1)
+    return payload
+
+
 def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
     """Run cheap probes that exercise the state paths used by the UI shell.
 
@@ -2601,13 +2637,21 @@ def _deep_health_checks(stream_check: dict | None = None) -> tuple[dict, bool]:
 def _handle_health(handler, parsed):
     deep = parse_qs(parsed.query or "").get("deep", [""])[0].lower() in {"1", "true", "yes", "on"}
     stream_check = _streams_lock_health()
+    run_check = _run_lifecycle_health()
     payload = {
         "status": "ok" if stream_check.get("status") == "ok" else "degraded",
         "sessions": len(SESSIONS),
         "active_streams": int(stream_check.get("active_streams") or 0),
+        "active_runs": int(run_check.get("active_runs") or 0),
+        "runs": run_check.get("runs", []),
+        "last_run_finished_at": run_check.get("last_run_finished_at"),
         "uptime_seconds": round(time.time() - SERVER_START_TIME, 1),
         "accept_loop": _accept_loop_health(handler),
     }
+    if "oldest_run_age_seconds" in run_check:
+        payload["oldest_run_age_seconds"] = run_check["oldest_run_age_seconds"]
+    if "idle_seconds_since_last_run" in run_check:
+        payload["idle_seconds_since_last_run"] = run_check["idle_seconds_since_last_run"]
     if deep:
         if stream_check.get("status") != "ok":
             payload["checks"] = {"streams_lock": stream_check}
@@ -3021,8 +3065,36 @@ def handle_get(handler, parsed) -> bool:
                     # longer visible conversation than the single state.db
                     # segment for this messaging session id. Prefer the longer
                     # sidecar so repaired WebUI history is not hidden behind the
-                    # canonical per-segment transcript.
-                    _all_msgs = sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
+                    # canonical per-segment transcript. When both sources carry
+                    # different slices of the same stitched conversation, merge
+                    # them chronologically and dedupe exact repeats.
+                    if sidecar_messages and sidecar_messages != cli_messages:
+                        merged_messages = []
+                        seen_message_keys = set()
+                        for msg in sorted(list(cli_messages) + list(sidecar_messages), key=lambda m: (
+                            float(m.get("timestamp") or 0),
+                            str(m.get("role") or ""),
+                            str(m.get("content") or ""),
+                        )):
+                            message_identity = msg.get("id") or msg.get("message_id")
+                            if message_identity:
+                                key = ("message_id", str(message_identity))
+                            else:
+                                key = (
+                                    "legacy",
+                                    str(msg.get("role") or ""),
+                                    str(msg.get("content") or ""),
+                                    str(msg.get("timestamp") or ""),
+                                    str(msg.get("tool_call_id") or ""),
+                                    str(msg.get("tool_name") or msg.get("name") or ""),
+                                )
+                            if key in seen_message_keys:
+                                continue
+                            seen_message_keys.add(key)
+                            merged_messages.append(msg)
+                        _all_msgs = merged_messages
+                    else:
+                        _all_msgs = sidecar_messages if len(sidecar_messages) > len(cli_messages) else cli_messages
                 else:
                     _all_msgs = s.messages
             else:
@@ -3176,6 +3248,15 @@ def handle_get(handler, parsed) -> bool:
                 sess = _merge_cli_sidebar_metadata(sess, cli_meta)
                 return j(handler, {"session": redact_session_data(sess)})
             return bad(handler, "Session not found", 404)
+
+    if parsed.path == "/api/session/lineage/report":
+        sid = parse_qs(parsed.query).get("session_id", [""])[0]
+        if not sid:
+            return bad(handler, "session_id required", 400)
+        report = read_session_lineage_report(_active_state_db_path(), sid)
+        if not report.get("found"):
+            return bad(handler, "Session not found", 404)
+        return j(handler, report)
 
     if parsed.path == "/api/session/status":
         sid = parse_qs(parsed.query).get("session_id", [""])[0]
@@ -3999,6 +4080,57 @@ def handle_post(handler, parsed) -> bool:
             s.save()
         return j(handler, {"ok": True, "enabled_toolsets": s.enabled_toolsets})
 
+    if parsed.path == "/api/session/draft":
+        # GET ?session_id=X  → return current draft
+        # POST body          → save draft { session_id, text?, files? }
+        # HTTP method is in handler.command (e.g. "POST", "GET"), parsed has no .method
+        if handler.command == "GET":
+            query = parse_qs(parsed.query)
+            sid = query.get("session_id", [""])[0] if parsed.query else ""
+            if not sid:
+                return bad(handler, "session_id is required", 400)
+            try:
+                s = get_session(sid)
+            except KeyError:
+                return bad(handler, "Session not found", 404)
+            draft = getattr(s, "composer_draft", {}) or {}
+            return j(handler, {"draft": draft})
+        # POST
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        sid = body["session_id"]
+        text = body.get("text")
+        files = body.get("files")
+        # Stage-326 hardening (per Opus advisor): size + type validation on
+        # the draft inputs. Without this, a misbehaving or malicious client
+        # can persist multi-MB strings into the session JSON on every keystroke
+        # via the 400ms debounced auto-save.
+        _MAX_DRAFT_TEXT = 50_000  # 50 KB cap on textarea content
+        _MAX_DRAFT_FILES = 50  # max number of attached file references
+        if text is not None and not isinstance(text, str):
+            text = ""
+        if isinstance(text, str) and len(text) > _MAX_DRAFT_TEXT:
+            text = text[:_MAX_DRAFT_TEXT]
+        if files is not None and not isinstance(files, list):
+            files = []
+        if isinstance(files, list) and len(files) > _MAX_DRAFT_FILES:
+            files = files[:_MAX_DRAFT_FILES]
+        try:
+            s = get_session(sid)
+        except KeyError:
+            return bad(handler, "Session not found", 404)
+        with _get_session_agent_lock(sid):
+            draft = getattr(s, "composer_draft", {}) or {}
+            if text is not None:
+                draft["text"] = text
+            if files is not None:
+                draft["files"] = files
+            s.composer_draft = draft
+            s.save()
+        return j(handler, {"ok": True, "draft": s.composer_draft})
+
     if parsed.path == "/api/session/update":
         try:
             require(body, "session_id")
@@ -4061,6 +4193,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Invalid session_id", 400)
         try:
             p.unlink(missing_ok=True)
+            p.with_suffix('.json.bak').unlink(missing_ok=True)
         except Exception:
             logger.debug("Failed to unlink session file %s", p)
         # Prune the per-session agent lock so deleted sessions don't leak
@@ -4179,6 +4312,7 @@ def handle_post(handler, parsed) -> bool:
             title=branch_title,
             messages=forked_messages,
             parent_session_id=source.session_id,
+            session_source="fork",
         )
         with LOCK:
             SESSIONS[branch.session_id] = branch
@@ -6453,6 +6587,7 @@ def _start_chat_stream_for_session(
     model_provider=None,
     normalized_model: bool = False,
     diag=None,
+    goal_related: bool = False,
 ):
     """Persist pending state, register an SSE channel, and start an agent turn."""
     attachments = attachments or []
@@ -6475,6 +6610,14 @@ def _start_chat_stream_for_session(
         # Stale stream id from a previous run; clear and continue.
         diag.stage("stale_stream_cleanup") if diag else None
         _clear_stale_stream_state(s)
+
+    # #1932: check if this session has a pending goal continuation flag.
+    # The streaming hook sets PENDING_GOAL_CONTINUATION when goal_continue fires,
+    # so the next chat/start for this session is automatically treated as goal-related.
+    if not goal_related and s.session_id in PENDING_GOAL_CONTINUATION:
+        goal_related = True
+        PENDING_GOAL_CONTINUATION.discard(s.session_id)
+
     stream_id = uuid.uuid4().hex
     session_lock = _get_session_agent_lock(s.session_id)
     diag.stage("session_lock_wait") if diag else None
@@ -6495,11 +6638,14 @@ def _start_chat_stream_for_session(
     stream = create_stream_channel()
     with STREAMS_LOCK:
         STREAMS[stream_id] = stream
+    # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
+    if goal_related:
+        STREAM_GOAL_RELATED[stream_id] = True
     diag.stage("worker_thread_start") if diag else None
     thr = threading.Thread(
         target=_run_agent_streaming,
         args=(s.session_id, msg, model, workspace, stream_id, attachments),
-        kwargs={"model_provider": model_provider},
+        kwargs={"model_provider": model_provider, "goal_related": goal_related},
         daemon=True,
     )
     thr.start()
@@ -6623,6 +6769,7 @@ def _handle_goal_command(handler, body):
             model=model,
             model_provider=model_provider,
             normalized_model=normalized_model,
+            goal_related=True,
         )
         status = int(stream_response.pop("_status", 200) or 200)
         payload.update(stream_response)
@@ -7441,6 +7588,38 @@ def _handle_session_compress(handler, body):
             return None
         return {"role": role, "ts": ts, "text": norm, "attachments": attach_count}
 
+    def _compression_summary_from_messages(messages):
+        text = None
+        for m in reversed(messages or []):
+            if not isinstance(m, dict):
+                continue
+            role = str(m.get("role") or "").lower()
+            if role != "assistant":
+                continue
+            if not isinstance(m.get("content"), str):
+                continue
+            content = str(m.get("content") or "").strip()
+            if not content:
+                continue
+            norm = re.sub(r"\s+", " ", content).strip()
+            if (
+                "context compaction" in norm.lower()
+                or "context compression" in norm.lower()
+            ):
+                return norm
+        return None
+
+    def _compact_summary_text(raw_text):
+        if not isinstance(raw_text, str):
+            return None
+        txt = raw_text.strip()
+        if not txt:
+            return None
+        txt = re.sub(r"\s+", " ", txt)
+        if len(txt) > 320:
+            txt = f"{txt[:314]}…"
+        return txt
+
     try:
         require(body, "session_id")
     except ValueError as e:
@@ -7627,6 +7806,12 @@ def _handle_session_compress(handler, body):
             visible_after = _visible_messages_for_anchor(compressed)
             s.compression_anchor_visible_idx = max(0, len(visible_after) - 1) if visible_after else None
             s.compression_anchor_message_key = _anchor_message_key(visible_after[-1]) if visible_after else None
+            summary_text = None
+            if isinstance(summary, dict):
+                summary_text = summary.get("reference_message") or summary.get("token_line") or summary.get("headline")
+            s.compression_anchor_summary = _compact_summary_text(
+                summary_text or _compression_summary_from_messages(compressed) or ""
+            )
             s.save()
 
         session_payload = redact_session_data(

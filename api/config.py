@@ -657,6 +657,7 @@ _PROVIDER_DISPLAY = {
     "qwen": "Qwen",
     "x-ai": "xAI",
     "nvidia": "NVIDIA NIM",
+    "xiaomi": "Xiaomi",
 }
 
 # Provider alias → canonical slug.  Users configure providers using the
@@ -707,6 +708,8 @@ _PROVIDER_ALIASES = {
     "nvidia-nim": "nvidia",
     "build-nvidia": "nvidia",
     "nemotron": "nvidia",
+    "mimo": "xiaomi",
+    "xiaomi-mimo": "xiaomi",
     # Legacy alias — earlier WebUI builds wrote ``provider: local`` for unknown
     # loopback endpoints, but ``local`` is not registered in
     # ``hermes_cli.auth.PROVIDER_REGISTRY``. Routing it through ``custom``
@@ -1065,6 +1068,14 @@ _PROVIDER_MODELS = {
         {"id": "nvidia/nemotron-3-nano-30b-a3b", "label": "Nemotron 3 Nano 30B"},
         {"id": "nvidia/llama-3.3-nemotron-super-49b-v1.5", "label": "Llama 3.3 Nemotron Super 49B"},
         {"id": "qwen/qwen3-next-80b-a3b-instruct", "label": "Qwen3 Next 80B"},
+    ],
+    # Xiaomi MiMo — direct API via api.xiaomimimo.com
+    "xiaomi": [
+        {"id": "mimo-v2.5-pro",    "label": "MiMo V2.5 Pro"},
+        {"id": "mimo-v2.5",        "label": "MiMo V2.5"},
+        {"id": "mimo-v2-pro",      "label": "MiMo V2 Pro"},
+        {"id": "mimo-v2-omni",     "label": "MiMo V2 Omni"},
+        {"id": "mimo-v2-flash",    "label": "MiMo V2 Flash"},
     ],
     # xAI — prefix used in OpenRouter model IDs (x-ai/grok-4-20)
     "x-ai": [
@@ -1430,6 +1441,44 @@ def _base_url_points_at_local_server(base_url: str) -> bool:
         return False
 
 
+def _custom_slug_rest_looks_like_host_port(rest: str) -> bool:
+    """True when ``custom:<rest>`` is an endpoint-style slug ``host:port``.
+
+    WebUI sometimes derives ``custom:10.8.71.41:8080`` from ``base_url`` authority.
+    The #1776 peel must not treat that middle colon as part of an eaten model
+    segment — otherwise ``@custom:10.8.71.41:8080:Qwen3`` wrongly becomes model
+    ``8080:Qwen3``.
+    """
+    rest = str(rest or "").strip()
+    if ":" not in rest:
+        return False
+    host, port_s = rest.rsplit(":", 1)
+    if not host or ":" in host:
+        return False
+    if not port_s.isdigit():
+        return False
+    try:
+        port_n = int(port_s)
+    except ValueError:
+        return False
+    if not (1 <= port_n <= 65535):
+        return False
+    try:
+        import ipaddress
+
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    hl = host.lower()
+    if hl == "localhost":
+        return True
+    # Typical DNS hostname used as proxy slug (contains at least one label dot).
+    if "." in host:
+        return True
+    return False
+
+
 def resolve_model_provider(model_id: str) -> tuple:
     """Resolve model name, provider, and base_url for AIAgent.
 
@@ -1479,18 +1528,36 @@ def resolve_model_provider(model_id: str) -> tuple:
 
     # Custom providers declared in config.yaml should win over slash-based
     # OpenRouter heuristics. Their model IDs commonly contain '/' too.
-    custom_providers = cfg.get("custom_providers", [])
-    if isinstance(custom_providers, list):
+    # However, when the active provider is an explicit non-custom provider and
+    # the requested model_id is the configured default model, that active
+    # provider takes precedence over overlapping custom_providers[] entries.
+    # Otherwise WebUI routes to custom:<name> instead of the intended endpoint
+    # and can surface a 401 from the wrong provider (#1922).
+    # For all other cases, preserve custom_providers[] routing for explicitly
+    # selected custom provider models.
+    _is_explicit_non_custom_provider = (
+        config_provider is not None
+        and config_provider != 'custom'
+        and not config_provider.startswith('custom:')
+    )
+    _default_model = model_cfg.get('default') if isinstance(model_cfg, dict) else None
+    _skip_custom_providers = (
+        _is_explicit_non_custom_provider
+        and _default_model is not None
+        and model_id == _default_model
+    )
+    custom_providers = cfg.get('custom_providers', [])
+    if isinstance(custom_providers, list) and not _skip_custom_providers:
         for entry in custom_providers:
             if not isinstance(entry, dict):
                 continue
-            entry_model = (entry.get("model") or "").strip()
-            entry_name = (entry.get("name") or "").strip()
-            entry_base_url = (entry.get("base_url") or "").strip()
+            entry_model = (entry.get('model') or '').strip()
+            entry_name = (entry.get('name') or '').strip()
+            entry_base_url = (entry.get('base_url') or '').strip()
             entry_model_ids = set()
             if entry_model:
                 entry_model_ids.add(entry_model)
-            entry_models = entry.get("models")
+            entry_models = entry.get('models')
             if isinstance(entry_models, dict):
                 entry_model_ids.update(
                     key.strip()
@@ -1498,7 +1565,7 @@ def resolve_model_provider(model_id: str) -> tuple:
                     if isinstance(key, str) and key.strip()
                 )
             if entry_name and model_id in entry_model_ids:
-                provider_hint = "custom:" + entry_name.lower().replace(" ", "-")
+                provider_hint = 'custom:' + entry_name.lower().replace(' ', '-')
                 return model_id, provider_hint, entry_base_url or None
 
     # @provider:model format — explicit provider hint from the dropdown.
@@ -1516,15 +1583,20 @@ def resolve_model_provider(model_id: str) -> tuple:
     # ("@custom:my-key:some-model:free"), rsplit yields
     # provider_hint="custom:my-key:some-model", bare_model="free", and the
     # custom-prefix guard below skips the split-fallback. Detect the
-    # over-split structurally — custom hints carry exactly one segment after
-    # "custom:", so any provider_hint with 2+ colons that starts with
-    # "custom:" has eaten part of the model name. Peel one segment back.
+    # over-split structurally — custom hints normally carry one slug segment
+    # after ``custom:``. If ``provider_hint`` has extra ``:`` tokens because the
+    # model ID contained tags like ``:free``, peel one segment back (#1776).
+    #
+    # Exception: ``custom:<ip-or-host>:<port>`` is a single logical slug derived
+    # from OpenAI ``base_url`` authority and contains no eaten model segments.
     if model_id.startswith("@") and ":" in model_id:
         inner = model_id[1:]
         provider_hint, bare_model = inner.rsplit(":", 1)
         if provider_hint.startswith("custom:") and provider_hint.count(":") >= 2:
-            provider_hint, extra = provider_hint.rsplit(":", 1)
-            bare_model = f"{extra}:{bare_model}"
+            _slug_rest = provider_hint[len("custom:"):]
+            if not _custom_slug_rest_looks_like_host_port(_slug_rest):
+                provider_hint, extra = provider_hint.rsplit(":", 1)
+                bare_model = f"{extra}:{bare_model}"
         elif (provider_hint not in _PROVIDER_MODELS
                 and provider_hint not in _PROVIDER_DISPLAY
                 and not provider_hint.startswith("custom:")):
@@ -2688,6 +2760,7 @@ def get_available_models() -> dict:
                 "GLM_API_KEY",
                 "KIMI_API_KEY",
                 "DEEPSEEK_API_KEY",
+                "XIAOMI_API_KEY",
                 "OPENCODE_ZEN_API_KEY",
                 "OPENCODE_GO_API_KEY",
                 "MINIMAX_API_KEY",
@@ -2723,6 +2796,8 @@ def get_available_models() -> dict:
                 detected_providers.add("minimax-cn")
             if all_env.get("DEEPSEEK_API_KEY"):
                 detected_providers.add("deepseek")
+            if all_env.get("XIAOMI_API_KEY"):
+                detected_providers.add("xiaomi")
             if all_env.get("XAI_API_KEY"):
                 detected_providers.add("x-ai")
             if all_env.get("MISTRAL_API_KEY"):
@@ -2949,7 +3024,7 @@ def get_available_models() -> dict:
         _custom_providers_cfg = cfg.get("custom_providers", [])
         _named_custom_groups: dict = {}
         if isinstance(_custom_providers_cfg, list):
-            _seen_custom_ids = {m["id"] for m in auto_detected_models}
+            _seen_custom_ids = set()
             for _cp in _custom_providers_cfg:
                 if not isinstance(_cp, dict):
                     continue
@@ -2970,9 +3045,10 @@ def get_available_models() -> dict:
                             _cp_model_ids.append(_m_id.strip())
 
                 for _cp_model in _cp_model_ids:
-                    if _cp_model and _cp_model not in _seen_custom_ids:
+                    _dedup_key = f"{_slug}:{_cp_model}" if _slug else _cp_model
+                    if _cp_model and _dedup_key not in _seen_custom_ids:
                         _cp_label = _get_label_for_model(_cp_model, [])
-                        _seen_custom_ids.add(_cp_model)
+                        _seen_custom_ids.add(_dedup_key)
                         if _slug:
                             detected_providers.add(_slug)
                             _cp_option_id = _cp_model
@@ -3606,7 +3682,49 @@ AGENT_INSTANCES: dict = {}  # stream_id -> AIAgent instance for interrupt propag
 STREAM_PARTIAL_TEXT: dict = {}  # stream_id -> partial assistant text accumulated during streaming
 STREAM_REASONING_TEXT: dict = {}  # stream_id -> reasoning trace accumulated during streaming (#1361 §A)
 STREAM_LIVE_TOOL_CALLS: dict = {}  # stream_id -> live tool calls accumulated during streaming (#1361 §B)
+STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal-related turns (#1932)
+PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
+
+# Active agent-run registry. This intentionally tracks worker lifecycle rather
+# than SSE lifecycle: cancel/reconnect may remove STREAMS while the worker is
+# still unwinding, blocked in a provider call, or waiting for delegated work.
+ACTIVE_RUNS: dict = {}
+ACTIVE_RUNS_LOCK = threading.Lock()
+LAST_RUN_FINISHED_AT: float | None = None
 SERVER_START_TIME = time.time()
+
+
+def register_active_run(stream_id: str, **metadata) -> None:
+    """Mark a WebUI agent worker as alive until its outer finally exits."""
+    if not stream_id:
+        return
+    now = time.time()
+    entry = dict(metadata or {})
+    entry.setdefault("stream_id", stream_id)
+    entry.setdefault("started_at", now)
+    entry.setdefault("phase", "running")
+    with ACTIVE_RUNS_LOCK:
+        ACTIVE_RUNS[stream_id] = entry
+
+
+def update_active_run(stream_id: str, **metadata) -> None:
+    """Update active-run metadata without creating a new run implicitly."""
+    if not stream_id:
+        return
+    with ACTIVE_RUNS_LOCK:
+        entry = ACTIVE_RUNS.get(stream_id)
+        if entry is not None:
+            entry.update(metadata)
+
+
+def unregister_active_run(stream_id: str) -> None:
+    """Remove a worker from the active-run registry and record idle start."""
+    if not stream_id:
+        return
+    global LAST_RUN_FINISHED_AT
+    with ACTIVE_RUNS_LOCK:
+        ACTIVE_RUNS.pop(stream_id, None)
+        LAST_RUN_FINISHED_AT = time.time()
 
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
 # _user_turn_count survives between turns.  This mirrors the gateway's
